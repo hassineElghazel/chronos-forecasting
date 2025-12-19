@@ -366,6 +366,181 @@ class GroupSelfAttention(nn.Module):
         return AttentionOutput(hidden_states=hidden_states, attn_weights=attention_output.attn_weights)
 
 
+class CrossGroupAttention(nn.Module):
+    """
+    Cross-Group Attention with Gated Fusion.
+    
+    This layer enables information flow between different groups (e.g., electricity prices
+    in Germany and France) by:
+    1. Creating group-level summary representations via mean pooling
+    2. Allowing each group to attend to summaries from ALL other groups using simple dot-product attention
+    3. Using a learnable gate to control how much cross-group information flows back
+    
+    This is a creative extension to Chronos-2 that can capture cross-market/cross-entity
+    correlations that the original within-group attention cannot.
+    """
+
+    def __init__(self, config: Chronos2CoreConfig):
+        super().__init__()
+        self.d_model = config.d_model
+        self.n_heads = config.num_heads
+        self.d_kv = config.d_kv
+        self.inner_dim = self.n_heads * self.d_kv
+        
+        # Layer norms
+        self.layer_norm_summary = Chronos2LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
+        self.layer_norm_cross = Chronos2LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
+        
+        # Cross-group attention projections (simple single-head attention for efficiency)
+        self.q_proj = nn.Linear(config.d_model, config.d_model, bias=False)
+        self.k_proj = nn.Linear(config.d_model, config.d_model, bias=False)
+        self.v_proj = nn.Linear(config.d_model, config.d_model, bias=False)
+        self.o_proj = nn.Linear(config.d_model, config.d_model, bias=False)
+        
+        # Gating mechanism: learns how much cross-group info to incorporate
+        self.gate_proj = nn.Linear(config.d_model * 2, config.d_model, bias=True)
+        
+        # Projection to broadcast cross-group info back to all time steps
+        self.broadcast_proj = nn.Linear(config.d_model, config.d_model, bias=False)
+        
+        self.dropout = nn.Dropout(config.dropout_rate)
+        self.scale = config.d_model ** -0.5
+
+    def _create_group_summaries(
+        self, 
+        hidden_states: torch.Tensor,  # (batch, time, d_model)
+        group_ids: torch.Tensor,  # (batch,)
+    ) -> tuple[torch.Tensor, torch.Tensor, list]:
+        """
+        Create a summary representation for each unique group using mean pooling.
+        
+        Returns:
+            group_summaries: (num_groups, d_model)
+            unique_groups: unique group IDs
+            group_to_batch_idx: mapping from group to batch indices
+        """
+        batch_size, seq_len, d_model = hidden_states.shape
+        unique_groups = torch.unique(group_ids)
+        num_groups = len(unique_groups)
+        
+        group_summaries = []
+        group_to_batch_idx = []
+        
+        for g_id in unique_groups:
+            # Find all batch elements belonging to this group
+            mask = (group_ids == g_id)
+            batch_indices = torch.where(mask)[0]
+            group_to_batch_idx.append(batch_indices)
+            
+            # Get hidden states for this group: (group_size, time, d_model)
+            group_hidden = hidden_states[mask]
+            
+            # Normalize and mean pool
+            normed_hidden = self.layer_norm_summary(group_hidden)
+            
+            # Mean pool over both batch elements in group and time: (d_model,)
+            summary = normed_hidden.mean(dim=(0, 1))
+            group_summaries.append(summary)
+        
+        # Stack all group summaries: (num_groups, d_model)
+        group_summaries = torch.stack(group_summaries, dim=0)
+        
+        return group_summaries, unique_groups, group_to_batch_idx
+
+    def _cross_group_attention(
+        self,
+        group_summaries: torch.Tensor,  # (num_groups, d_model)
+    ) -> torch.Tensor:
+        """
+        Apply cross-group attention: each group attends to all groups.
+        Uses simple scaled dot-product attention.
+        
+        Returns:
+            cross_group_info: (num_groups, d_model)
+        """
+        num_groups = group_summaries.shape[0]
+        
+        # Normalize
+        normed_summaries = self.layer_norm_cross(group_summaries)
+        
+        # Project to Q, K, V
+        Q = self.q_proj(normed_summaries)  # (num_groups, d_model)
+        K = self.k_proj(normed_summaries)  # (num_groups, d_model)
+        V = self.v_proj(normed_summaries)  # (num_groups, d_model)
+        
+        # Compute attention scores: (num_groups, num_groups)
+        attn_scores = torch.matmul(Q, K.transpose(-1, -2)) * self.scale
+        attn_weights = torch.softmax(attn_scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+        
+        # Apply attention to values: (num_groups, d_model)
+        attn_output = torch.matmul(attn_weights, V)
+        
+        # Project output
+        cross_group_info = self.o_proj(attn_output)
+        
+        return cross_group_info, attn_weights
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,  # (batch, time, d_model)
+        group_ids: torch.Tensor,  # (batch,)
+        output_attentions: bool = False,
+    ) -> AttentionOutput:
+        """
+        Apply cross-group attention with gated fusion.
+        
+        1. Create summary for each group via mean pooling
+        2. Each group attends to ALL group summaries (including itself)
+        3. Gate the cross-group information and add to original representation
+        """
+        batch_size, seq_len, d_model = hidden_states.shape
+        device = hidden_states.device
+        dtype = hidden_states.dtype
+        
+        # Handle edge case: only one group (no cross-group attention needed)
+        unique_groups = torch.unique(group_ids)
+        if len(unique_groups) <= 1:
+            return AttentionOutput(hidden_states=hidden_states, attn_weights=None)
+        
+        # Step 1: Create group summaries
+        group_summaries, unique_groups, group_to_batch_idx = self._create_group_summaries(
+            hidden_states, group_ids
+        )
+        
+        # Step 2: Cross-group attention
+        cross_group_info, attn_weights = self._cross_group_attention(group_summaries)
+        
+        # Step 3: Broadcast cross-group information back to each batch element
+        # and apply gating
+        output_hidden_states = hidden_states.clone()
+        
+        for g_idx, batch_indices in enumerate(group_to_batch_idx):
+            # Get cross-group info for this group
+            cross_info = cross_group_info[g_idx]  # (d_model,)
+            
+            # Broadcast to all time steps for this group's batch elements
+            cross_info_broadcast = self.broadcast_proj(cross_info)  # (d_model,)
+            cross_info_expanded = cross_info_broadcast.unsqueeze(0).unsqueeze(0)  # (1, 1, d_model)
+            cross_info_expanded = cross_info_expanded.expand(len(batch_indices), seq_len, -1)  # (group_size, time, d_model)
+            
+            # Get original hidden states for this group
+            group_hidden = hidden_states[batch_indices]  # (group_size, time, d_model)
+            
+            # Compute gate: sigmoid(W * [original; cross_info])
+            gate_input = torch.cat([group_hidden, cross_info_expanded], dim=-1)  # (group_size, time, 2*d_model)
+            gate = torch.sigmoid(self.gate_proj(gate_input))  # (group_size, time, d_model)
+            
+            # Apply gated fusion: output = original + gate * dropout(cross_info)
+            gated_cross_info = gate * self.dropout(cross_info_expanded)
+            output_hidden_states[batch_indices] = group_hidden + gated_cross_info
+        
+        return AttentionOutput(
+            hidden_states=output_hidden_states,
+            attn_weights=attn_weights if output_attentions else None
+        )
+
+
 class ResidualBlock(nn.Module):
     """A generic residual block which can be used for input and output embedding layers"""
 
