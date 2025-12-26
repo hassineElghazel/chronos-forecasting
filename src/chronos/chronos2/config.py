@@ -73,6 +73,10 @@ class Chronos2CoreConfig(PretrainedConfig):
         cross_group_always_include_self: bool = True,  # Always include self-attention in top-k/threshold
         cross_group_use_sparse_routing: bool = False,  # Use learned sparse routing (entmax-style)
         cross_group_routing_temperature: float = 1.0,  # Temperature for sparse routing softmax
+        cross_group_dynamic_routing: bool = False,  # Dynamic: compute similarity and skip if dissimilar
+        cross_group_dynamic_threshold: float = 0.5,  # Min avg cosine similarity to enable cross-group
+        cross_group_margin_gate: bool = False,  # Require clear separation (top1 - median > delta)
+        cross_group_margin_delta: float = 0.1,  # Min margin between top1 and median similarity
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -93,6 +97,10 @@ class Chronos2CoreConfig(PretrainedConfig):
         self.cross_group_always_include_self = cross_group_always_include_self
         self.cross_group_use_sparse_routing = cross_group_use_sparse_routing
         self.cross_group_routing_temperature = cross_group_routing_temperature
+        self.cross_group_dynamic_routing = cross_group_dynamic_routing
+        self.cross_group_dynamic_threshold = cross_group_dynamic_threshold
+        self.cross_group_margin_gate = cross_group_margin_gate
+        self.cross_group_margin_delta = cross_group_margin_delta
 
         act_info = self.feed_forward_proj.split("-")
         self.dense_act_fn = act_info[-1]

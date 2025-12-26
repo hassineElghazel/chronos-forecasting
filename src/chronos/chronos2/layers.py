@@ -403,6 +403,18 @@ class CrossGroupAttention(nn.Module):
         self.always_include_self = getattr(config, 'cross_group_always_include_self', True)
         self.use_sparse_routing = getattr(config, 'cross_group_use_sparse_routing', False)
         self.routing_temperature = getattr(config, 'cross_group_routing_temperature', 1.0)
+        # Dynamic routing: skip cross-group attention if groups are dissimilar
+        self.dynamic_routing = getattr(config, 'cross_group_dynamic_routing', False)
+        self.dynamic_threshold = getattr(config, 'cross_group_dynamic_threshold', 0.5)
+        # Margin gate: require clear separation (top1 - median > delta) to reduce false positives
+        self.margin_gate = getattr(config, 'cross_group_margin_gate', False)
+        self.margin_delta = getattr(config, 'cross_group_margin_delta', 0.1)
+        
+        # Tracking statistics (updated during forward pass)
+        self._last_avg_similarity = None
+        self._last_margin = None  # top1 - median similarity
+        self._last_cross_group_applied = None
+        self._stats_history = []  # List of (avg_sim, margin, was_applied, skip_reason) tuples
         
         # Layer norms
         self.layer_norm_summary = Chronos2LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
@@ -664,8 +676,9 @@ class CrossGroupAttention(nn.Module):
         
         Pipeline:
         1. Create summary for each group via mean pooling: (B, T, D) -> (G, D)
-        2. Selective cross-group attention: (G, D) -> (G, D)
-        3. Broadcast back to all tokens with gating: (G, D) -> (B, T, D)
+        2. (Optional) Dynamic routing: check if groups are similar enough
+        3. Selective cross-group attention: (G, D) -> (G, D)
+        4. Broadcast back to all tokens with gating: (G, D) -> (B, T, D)
         
         Complexity:
         - Summary creation: O(B * T * D)
@@ -680,6 +693,8 @@ class CrossGroupAttention(nn.Module):
         unique_groups = torch.unique(group_ids)
         G = len(unique_groups)
         if G <= 1:
+            self._last_avg_similarity = 1.0
+            self._last_cross_group_applied = False
             return AttentionOutput(hidden_states=hidden_states, attn_weights=None)
         
         # Step 1: Create group summaries - (B, T, D) -> (G, D)
@@ -687,7 +702,47 @@ class CrossGroupAttention(nn.Module):
             hidden_states, group_ids
         )
         
-        # Step 2: Selective cross-group attention - (G, D) -> (G, D)
+        # Step 2: Dynamic routing check - compute avg similarity and decide
+        if self.dynamic_routing or self.margin_gate:
+            cosine_sim = self._compute_cosine_similarity(group_summaries)  # (G, G)
+            # Off-diagonal similarities (exclude self-similarity on diagonal)
+            mask = ~torch.eye(G, dtype=torch.bool, device=device)
+            off_diag_sims = cosine_sim[mask]
+            avg_similarity = off_diag_sims.mean().item() if G > 1 else 1.0
+            
+            # Compute margin: for each group, get max similarity to other groups
+            # Then compute margin = top1 - median across all off-diagonal
+            if G > 2:
+                top1_sim = off_diag_sims.max().item()
+                median_sim = off_diag_sims.median().item()
+                margin = top1_sim - median_sim
+            else:
+                margin = 0.0  # Can't compute margin with only 2 groups
+            
+            self._last_avg_similarity = avg_similarity
+            self._last_margin = margin
+            
+            # Gate 1: Average similarity threshold
+            if self.dynamic_routing and avg_similarity < self.dynamic_threshold:
+                self._last_cross_group_applied = False
+                self._stats_history.append((avg_similarity, margin, False, "low_avg_sim"))
+                return AttentionOutput(hidden_states=hidden_states, attn_weights=None)
+            
+            # Gate 2: Margin gate - require clear separation to avoid false positives
+            # Skip if everything is "vaguely similar" (high avg but low margin)
+            if self.margin_gate and margin < self.margin_delta:
+                self._last_cross_group_applied = False
+                self._stats_history.append((avg_similarity, margin, False, "low_margin"))
+                return AttentionOutput(hidden_states=hidden_states, attn_weights=None)
+            
+            self._last_cross_group_applied = True
+            self._stats_history.append((avg_similarity, margin, True, "applied"))
+        else:
+            self._last_avg_similarity = None
+            self._last_margin = None
+            self._last_cross_group_applied = True
+        
+        # Step 3: Selective cross-group attention - (G, D) -> (G, D)
         cross_group_info, attn_weights = self._cross_group_attention(group_summaries)
         
         # Step 3: Broadcast cross-group info back to each batch element with gating
