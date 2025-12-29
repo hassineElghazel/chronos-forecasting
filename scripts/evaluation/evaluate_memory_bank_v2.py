@@ -11,6 +11,12 @@ Key features:
    - retrieve top N (retrieve_k) with a low retrieval threshold
    - use at most M (use_k) neighbors only when gate passes
 6) Optional safety: disable memory augmentation when train bank is too small (min_train_series_for_memory).
+
+IMPORTANT PERF FIX (your 4s/it issue):
+- Previously, Option A was calling pipeline.predict_quantiles() PER SERIES for all non-gated queries.
+  That kills GPU utilization and adds huge Python/dispatch overhead.
+- Now: within each batch, we run ONE batched baseline call for all non-gated queries,
+  and only run per-query calls for the gated ones (typically a small fraction).
 """
 
 import hashlib
@@ -294,15 +300,43 @@ def _process_single_quantile_output(q_one: np.ndarray) -> np.ndarray:
     return arr.swapaxes(-1, -2)  # (Q,H) -> (H,Q)
 
 
+def _batch_quantiles_to_bhq(quantiles) -> np.ndarray:
+    """
+    Convert pipeline.predict_quantiles() output to a numpy array shaped (B, H, Q).
+    Accepts either:
+      - list of arrays (each like (1,Q,H) or (Q,H))
+      - numpy array (B,Q,H) or (B,1,Q,H) etc (handled conservatively)
+    """
+    if isinstance(quantiles, list):
+        # Each element typically (1,Q,H)
+        arr = np.stack(quantiles, axis=0)
+        # If (B,1,Q,H) -> squeeze the singleton
+        if arr.ndim == 4 and arr.shape[1] == 1:
+            arr = arr.squeeze(axis=1)  # (B,Q,H)
+        if arr.ndim != 3:
+            raise ValueError(f"Unexpected stacked quantiles shape: {arr.shape}")
+    else:
+        arr = np.asarray(quantiles)
+        # best-effort squeeze
+        while arr.ndim > 3 and arr.shape[1] == 1:
+            arr = arr.squeeze(axis=1)
+        if arr.ndim != 3:
+            raise ValueError(f"Unexpected quantiles ndarray shape: {arr.shape}")
+
+    # (B,Q,H) -> (B,H,Q)
+    return arr.swapaxes(-1, -2)
+
+
 def generate_forecasts_baseline(
-    test_data_input,
+    test_data_input_list: List[dict],
     pipeline: Chronos2Pipeline,
     prediction_length: int,
     batch_size: int,
     cross_learning: bool = False,
 ):
     forecast_outputs = []
-    for batch in tqdm(batcher(test_data_input, batch_size=batch_size), desc="Forecasting"):
+
+    for batch in tqdm(batcher(test_data_input_list, batch_size=batch_size), desc="Forecasting"):
         context = [torch.tensor(entry["target"]) for entry in batch]
         quantiles, _ = pipeline.predict_quantiles(
             context,
@@ -310,15 +344,13 @@ def generate_forecasts_baseline(
             quantile_levels=QUANTILES,
             cross_learning=cross_learning,
         )
-        if isinstance(quantiles, list):
-            quantiles = np.stack(quantiles).squeeze(axis=1)  # (B,Q,H)
-        quantiles = quantiles.swapaxes(-1, -2)  # (B,H,Q)
-        forecast_outputs.append(quantiles)
+        bhq = _batch_quantiles_to_bhq(quantiles)
+        forecast_outputs.append(bhq)
 
-    forecast_outputs = np.concatenate(forecast_outputs, axis=0)
+    forecast_outputs = np.concatenate(forecast_outputs, axis=0)  # (N,H,Q)
 
     forecasts = []
-    for item, ts in zip(forecast_outputs, test_data_input):
+    for item, ts in zip(forecast_outputs, test_data_input_list):
         forecast_start_date = ts["start"] + len(ts["target"])
         forecasts.append(
             QuantileForecast(
@@ -331,7 +363,7 @@ def generate_forecasts_baseline(
 
 
 def generate_forecasts_with_memory_option_a(
-    test_data_input,
+    test_data_input_list: List[dict],
     pipeline: Chronos2Pipeline,
     memory_forecaster: MemoryAugmentedForecasterV2,
     train_by_id: Dict[int, dict],
@@ -350,8 +382,12 @@ def generate_forecasts_with_memory_option_a(
           max_sim >= similarity_threshold AND (max_sim - second_sim) >= gap_threshold
       - if gate passes: use up to use_k neighbors, run Chronos on [query + neighbors] with cross_learning=True
       - keep only the query forecast
+
+    PERF:
+      - baseline (gate-off) queries are forecasted in one batched call per batch
+      - only gate-on queries do per-query calls (small fraction)
     """
-    forecasts = []
+    forecasts: List[QuantileForecast] = []
     device = pipeline.model.device
     d_model = pipeline.model.config.d_model
 
@@ -359,8 +395,8 @@ def generate_forecasts_with_memory_option_a(
     gated_queries = 0
     retrieved_total = 0
     candidates_total = 0
-    max_sims = []
-    gaps = []
+    max_sims: List[float] = []
+    gaps: List[float] = []
 
     # Dataset-level safety: too-small memory
     if int(min_train_series_for_memory) > 0 and len(train_by_id) < int(min_train_series_for_memory):
@@ -369,7 +405,7 @@ def generate_forecasts_with_memory_option_a(
             "Falling back to baseline for memory(A)."
         )
         forecasts = generate_forecasts_baseline(
-            test_data_input,
+            test_data_input_list,
             pipeline,
             prediction_length=prediction_length,
             batch_size=batch_size,
@@ -378,7 +414,7 @@ def generate_forecasts_with_memory_option_a(
         diag = {
             "disabled": True,
             "disabled_reason": f"train_bank<{min_train_series_for_memory}",
-            "total_rows": len(list(test_data_input)) if hasattr(test_data_input, "__len__") else 0,
+            "total_rows": len(test_data_input_list),
             "candidate_rate": 0.0,
             "gate_rate": 0.0,
             "avg_neighbors_used": 0.0,
@@ -392,17 +428,29 @@ def generate_forecasts_with_memory_option_a(
         }
         return forecasts, diag
 
-    for batch in tqdm(batcher(test_data_input, batch_size=batch_size), desc="Forecasting (Option A)"):
+    for batch in tqdm(batcher(test_data_input_list, batch_size=batch_size), desc="Forecasting (Option A)"):
+        # Prepare batch tensors
         context = [torch.tensor(entry["target"]) for entry in batch]
         reps = encode_series_statistical(context, d_model, device)
 
-        # Try to use stable ids if present; otherwise -1 (still okay for retrieval, exclusion may be weaker)
+        # Stable IDs (ideally present through split+instances)
         query_ids = [int(entry.get("item_id", -1)) for entry in batch]
         query_ids_tensor = torch.tensor(query_ids, device=device, dtype=torch.long)
 
+        # Retrieve neighbors for whole batch
         _, sims, mask, retrieved_ids = memory_forecaster.memory_bank.retrieve(
             reps, query_ids=query_ids_tensor, exclude_ids=True
         )
+
+        B = len(batch)
+        batch_forecast_arrays: List[np.ndarray] = [None] * B  # each will be (H,Q)
+
+        # Collect non-gated indices for one batched baseline call
+        non_gated_indices: List[int] = []
+        non_gated_contexts: List[torch.Tensor] = []
+
+        # Store gated groups (index -> group_inputs)
+        gated_groups: Dict[int, List[torch.Tensor]] = {}
 
         for i, (ctx, ts) in enumerate(zip(context, batch)):
             total_queries += 1
@@ -412,7 +460,12 @@ def generate_forecasts_with_memory_option_a(
             nb_sims = sims[i][valid_mask]
 
             # keep only existing neighbors
-            nb_pairs = [(int(nid), float(sim)) for nid, sim in zip(nb_ids, nb_sims) if int(nid) in train_by_id]
+            nb_pairs = [
+                (int(nid), float(sim))
+                for nid, sim in zip(nb_ids, nb_sims)
+                if int(nid) in train_by_id
+            ]
+
             if len(nb_pairs) > 0:
                 candidates_total += 1
 
@@ -421,64 +474,80 @@ def generate_forecasts_with_memory_option_a(
             nb_pairs = nb_pairs[: int(retrieve_k)]
 
             if len(nb_pairs) == 0:
-                # fallback baseline
+                # no candidates -> baseline
+                non_gated_indices.append(i)
+                non_gated_contexts.append(ctx)
+                continue
+
+            max_sim = nb_pairs[0][1]
+            max_sims.append(max_sim)
+
+            if len(nb_pairs) >= 2:
+                gap = max_sim - nb_pairs[1][1]
+                gaps.append(gap)
+            else:
+                gap = -1.0  # no top2 => cannot pass a positive gap_threshold
+
+            use_neighbors = (max_sim >= float(similarity_threshold)) and (gap >= float(gap_threshold))
+
+            if not use_neighbors:
+                non_gated_indices.append(i)
+                non_gated_contexts.append(ctx)
+                continue
+
+            # Gate ON
+            gated_queries += 1
+            use_pairs = nb_pairs[: int(use_k)]
+            retrieved_total += len(use_pairs)
+
+            Lq = int(ctx.numel())
+            neighbor_series: List[torch.Tensor] = []
+            for nid, _ in use_pairs:
+                tgt = np.asarray(train_by_id[nid]["target"], dtype=np.float32)
+                tgt = tgt[:Lq]
+                neighbor_series.append(torch.tensor(tgt))
+
+            gated_groups[i] = [ctx] + neighbor_series
+
+        # 1) Batched baseline for all non-gated in this batch
+        if len(non_gated_contexts) > 0:
+            q_list, _ = pipeline.predict_quantiles(
+                non_gated_contexts,
+                prediction_length=prediction_length,
+                quantile_levels=QUANTILES,
+                cross_learning=False,
+            )
+            bhq = _batch_quantiles_to_bhq(q_list)  # (n,H,Q)
+            for j, idx in enumerate(non_gated_indices):
+                batch_forecast_arrays[idx] = bhq[j]
+
+        # 2) Per-query cross-learning for gated ones (small fraction)
+        for idx, group_inputs in gated_groups.items():
+            q_list, _ = pipeline.predict_quantiles(
+                group_inputs,
+                prediction_length=prediction_length,
+                quantile_levels=QUANTILES,
+                cross_learning=True,
+                batch_size=len(group_inputs),
+            )
+            batch_forecast_arrays[idx] = _process_single_quantile_output(q_list[0])
+
+        # Sanity: ensure all filled
+        for i, ts in enumerate(batch):
+            if batch_forecast_arrays[i] is None:
+                # ultra-defensive fallback (should not happen)
                 q_list, _ = pipeline.predict_quantiles(
-                    [ctx],
+                    [context[i]],
                     prediction_length=prediction_length,
                     quantile_levels=QUANTILES,
                     cross_learning=False,
                 )
-                forecast_array = _process_single_quantile_output(q_list[0])
-            else:
-                max_sim = nb_pairs[0][1]
-                max_sims.append(max_sim)
-
-                # Need top2 to assess "peakedness"
-                if len(nb_pairs) >= 2:
-                    gap = max_sim - nb_pairs[1][1]
-                    gaps.append(gap)
-                else:
-                    gap = -1.0  # indicates "no top2 available"
-
-                use_neighbors = (max_sim >= float(similarity_threshold)) and (gap >= float(gap_threshold))
-
-                if use_neighbors:
-                    gated_queries += 1
-
-                    # now select up to use_k actual neighbors
-                    use_pairs = nb_pairs[: int(use_k)]
-                    retrieved_total += len(use_pairs)
-
-                    Lq = int(ctx.numel())
-                    neighbor_series = []
-                    for nid, _ in use_pairs:
-                        tgt = np.asarray(train_by_id[nid]["target"], dtype=np.float32)
-                        tgt = tgt[:Lq]
-                        neighbor_series.append(torch.tensor(tgt))
-
-                    group_inputs = [ctx] + neighbor_series
-                    q_list, _ = pipeline.predict_quantiles(
-                        group_inputs,
-                        prediction_length=prediction_length,
-                        quantile_levels=QUANTILES,
-                        cross_learning=True,
-                        batch_size=len(group_inputs),
-                    )
-                    forecast_array = _process_single_quantile_output(q_list[0])
-                else:
-                    # fallback baseline if gate is off
-                    q_list, _ = pipeline.predict_quantiles(
-                        [ctx],
-                        prediction_length=prediction_length,
-                        quantile_levels=QUANTILES,
-                        cross_learning=False,
-                    )
-                    forecast_array = _process_single_quantile_output(q_list[0])
+                batch_forecast_arrays[i] = _process_single_quantile_output(q_list[0])
 
             forecast_start_date = ts["start"] + len(ts["target"])
             forecasts.append(
                 QuantileForecast(
-                    forecast_arrays=forecast_array,  # (H,Q)
+                    forecast_arrays=batch_forecast_arrays[i],  # (H,Q)
                     forecast_keys=list(map(str, QUANTILES)),
                     start_date=forecast_start_date,
                 )
@@ -580,6 +649,9 @@ def evaluate(
 
         test_data, train_list = load_and_split_dataset(cfg)
 
+        # IMPORTANT: materialize inputs once (avoid iterator exhaustion & allow len())
+        test_input_list = list(test_data.input)
+
         # Fresh memory forecaster per dataset
         memory_forecaster = MemoryAugmentedForecasterV2(memory_config)
 
@@ -597,7 +669,7 @@ def evaluate(
         logger.info("  [baseline]")
         t0 = time.time()
         forecasts = generate_forecasts_baseline(
-            test_data.input, pipeline, prediction_length, batch_size, cross_learning=False
+            test_input_list, pipeline, prediction_length, batch_size, cross_learning=False
         )
         metrics = evaluate_forecasts(
             forecasts,
@@ -614,7 +686,7 @@ def evaluate(
         logger.info("  [cross_learning]")
         t0 = time.time()
         forecasts = generate_forecasts_baseline(
-            test_data.input, pipeline, prediction_length, batch_size, cross_learning=True
+            test_input_list, pipeline, prediction_length, batch_size, cross_learning=True
         )
         metrics = evaluate_forecasts(
             forecasts,
@@ -635,7 +707,7 @@ def evaluate(
         )
         t0 = time.time()
         forecasts, diag = generate_forecasts_with_memory_option_a(
-            test_data.input,
+            test_input_list,
             pipeline,
             memory_forecaster,
             train_by_id=train_by_id,
@@ -689,8 +761,12 @@ def evaluate(
 
         logger.info(f"  Summary for {dataset_name}:")
         if baseline_mase != 0:
-            logger.info(f"    cross_learning vs baseline: {(baseline_mase - cl_mase) / baseline_mase * 100:+.2f}% MASE")
-            logger.info(f"    memory(A) vs baseline: {(baseline_mase - mem_mase) / baseline_mase * 100:+.2f}% MASE")
+            # This reports "relative improvement" where + means BETTER (lower MASE),
+            # and - means WORSE, because MASE lower is better.
+            cl_impr = (baseline_mase - cl_mase) / baseline_mase * 100
+            mem_impr = (baseline_mase - mem_mase) / baseline_mase * 100
+            logger.info(f"    cross_learning vs baseline: {cl_impr:+.2f}% (positive=better)")
+            logger.info(f"    memory(A) vs baseline: {mem_impr:+.2f}% (positive=better)")
 
     # Save results
     df = pd.DataFrame(all_results)
